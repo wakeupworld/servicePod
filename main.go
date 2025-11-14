@@ -7,7 +7,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
+	"time"
 
+	"gopkg.in/yaml.v3"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
@@ -15,7 +18,9 @@ import (
 )
 
 const (
-	defaultPort = "8080"
+	defaultPort                = "8080"
+	defaultDeploymentToRestart = "registration-agent"
+	restartAnnotationKey       = "kubectl.kubernetes.io/restartedAt"
 )
 
 type PatchRequest struct {
@@ -160,6 +165,20 @@ func (s *Server) patchConfigMapHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// Restart the registration-agent deployment after successful patch
+		deploymentName := os.Getenv("RESTART_DEPLOYMENT")
+		if deploymentName == "" {
+			deploymentName = defaultDeploymentToRestart
+		}
+
+		restartErr := s.restartDeployment(req.Namespace, deploymentName)
+		if restartErr != nil {
+			// Log error but don't fail the request - patch was successful
+			log.Printf("Warning: Failed to restart deployment %s/%s: %v", req.Namespace, deploymentName, restartErr)
+		} else {
+			log.Printf("Successfully restarted deployment %s/%s", req.Namespace, deploymentName)
+		}
+
 		response = PatchResponse{
 			Success:   true,
 			Message:   "ConfigMap patched successfully",
@@ -197,22 +216,53 @@ func (s *Server) checkIfPatchNeeded(namespace, name string, patch map[string]int
 
 	// Check if all patch values already exist and match current values
 	for key, value := range patchData {
-		// Convert patch value to string for comparison
-		var patchValueStr string
-		switch v := value.(type) {
-		case string:
-			patchValueStr = v
-		default:
-			// Convert other types to string
-			patchValueStr = fmt.Sprintf("%v", v)
-		}
-
-		// If key doesn't exist or value is different, patch is needed
 		currentValue, exists := currentData[key]
-		if !exists || currentValue != patchValueStr {
-			log.Printf("ConfigMap %s/%s needs patch: key=%s, current=%v, desired=%v",
-				namespace, name, key, currentValue, patchValueStr)
-			return true, nil
+
+		// Check if this is a YAML field update (value is a map, not a string)
+		if patchMap, isMap := value.(map[string]interface{}); isMap {
+			// This is a YAML field update - parse and compare YAML structures
+			if !exists {
+				// Key doesn't exist, patch needed
+				log.Printf("ConfigMap %s/%s needs patch: key=%s doesn't exist", namespace, name, key)
+				return true, nil
+			}
+
+			// Parse current YAML
+			var currentYAML map[string]interface{}
+			if err := yaml.Unmarshal([]byte(currentValue), &currentYAML); err != nil {
+				// Not valid YAML, treat as regular string comparison
+				log.Printf("ConfigMap %s/%s key=%s is not valid YAML, treating as string", namespace, name, key)
+				if currentValue != fmt.Sprintf("%v", value) {
+					return true, nil
+				}
+				continue
+			}
+
+			// Check if YAML fields need updating
+			needsUpdate, err := compareYAMLFields(currentYAML, patchMap)
+			if err != nil {
+				return false, fmt.Errorf("failed to compare YAML fields for key %s: %w", key, err)
+			}
+			if needsUpdate {
+				log.Printf("ConfigMap %s/%s needs patch: YAML fields in key=%s differ", namespace, name, key)
+				return true, nil
+			}
+		} else {
+			// Regular string value comparison
+			var patchValueStr string
+			switch v := value.(type) {
+			case string:
+				patchValueStr = v
+			default:
+				patchValueStr = fmt.Sprintf("%v", v)
+			}
+
+			// If key doesn't exist or value is different, patch is needed
+			if !exists || currentValue != patchValueStr {
+				log.Printf("ConfigMap %s/%s needs patch: key=%s, current=%v, desired=%v",
+					namespace, name, key, currentValue, patchValueStr)
+				return true, nil
+			}
 		}
 	}
 
@@ -221,8 +271,20 @@ func (s *Server) checkIfPatchNeeded(namespace, name string, patch map[string]int
 }
 
 func (s *Server) patchConfigMap(namespace, name string, patch map[string]interface{}, patchType string) error {
+	// Get current ConfigMap to handle YAML merging
+	cm, err := s.clientset.CoreV1().ConfigMaps(namespace).Get(context.Background(), name, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to get ConfigMap: %w", err)
+	}
+
+	// Process YAML field updates before patching
+	processedPatch, err := s.processYAMLUpdates(cm.Data, patch)
+	if err != nil {
+		return fmt.Errorf("failed to process YAML updates: %w", err)
+	}
+
 	// Convert patch to JSON bytes
-	patchBytes, err := json.Marshal(patch)
+	patchBytes, err := json.Marshal(processedPatch)
 	if err != nil {
 		return fmt.Errorf("failed to marshal patch: %w", err)
 	}
@@ -242,6 +304,243 @@ func (s *Server) patchConfigMap(namespace, name string, patch map[string]interfa
 
 	log.Printf("Successfully patched ConfigMap %s/%s", namespace, name)
 	return nil
+}
+
+// restartDeployment restarts a deployment by updating its pod template annotation
+// This triggers Kubernetes to recreate the pods, picking up the new ConfigMap values
+func (s *Server) restartDeployment(namespace, deploymentName string) error {
+	// Update the pod template annotation with current timestamp
+	// This will trigger a rollout restart
+	restartTime := time.Now().Format(time.RFC3339)
+
+	// Create patch to update the annotation
+	patch := map[string]interface{}{
+		"spec": map[string]interface{}{
+			"template": map[string]interface{}{
+				"metadata": map[string]interface{}{
+					"annotations": map[string]interface{}{
+						restartAnnotationKey: restartTime,
+					},
+				},
+			},
+		},
+	}
+
+	patchBytes, err := json.Marshal(patch)
+	if err != nil {
+		return fmt.Errorf("failed to marshal patch: %w", err)
+	}
+
+	// Patch the deployment
+	_, err = s.clientset.AppsV1().Deployments(namespace).Patch(
+		context.Background(),
+		deploymentName,
+		types.StrategicMergePatchType,
+		patchBytes,
+		metav1.PatchOptions{},
+	)
+
+	if err != nil {
+		return fmt.Errorf("failed to patch deployment: %w", err)
+	}
+
+	log.Printf("Deployment %s/%s restart triggered (annotation updated to %s)", namespace, deploymentName, restartTime)
+	return nil
+}
+
+// processYAMLUpdates processes YAML field updates by merging map values into YAML strings
+func (s *Server) processYAMLUpdates(currentData map[string]string, patch map[string]interface{}) (map[string]interface{}, error) {
+	// Deep copy the patch to avoid modifying the original
+	patchData, ok := patch["data"].(map[string]interface{})
+	if !ok {
+		return patch, nil
+	}
+
+	processedData := make(map[string]interface{})
+
+	for key, value := range patchData {
+		// Check if this is a YAML field update (value is a map, not a string)
+		if patchMap, isMap := value.(map[string]interface{}); isMap {
+			// Get current YAML value
+			currentValue, exists := currentData[key]
+			if !exists {
+				currentValue = ""
+			}
+
+			// Parse current YAML
+			var currentYAML map[string]interface{}
+			if err := yaml.Unmarshal([]byte(currentValue), &currentYAML); err != nil {
+				// Not valid YAML, create new YAML from patch map
+				log.Printf("Key %s doesn't contain valid YAML, creating new YAML", key)
+				currentYAML = make(map[string]interface{})
+			}
+
+			// Merge patch fields into YAML structure
+			mergedYAML, err := mergeYAMLFields(currentYAML, patchMap)
+			if err != nil {
+				return nil, fmt.Errorf("failed to merge YAML fields for key %s: %w", key, err)
+			}
+
+			// Serialize merged YAML back to string
+			yamlBytes, err := yaml.Marshal(mergedYAML)
+			if err != nil {
+				return nil, fmt.Errorf("failed to marshal YAML for key %s: %w", key, err)
+			}
+
+			processedData[key] = string(yamlBytes)
+		} else {
+			// Regular string value, keep as is
+			processedData[key] = value
+		}
+	}
+
+	result := make(map[string]interface{})
+	for k, v := range patch {
+		if k == "data" {
+			result[k] = processedData
+		} else {
+			result[k] = v
+		}
+	}
+
+	return result, nil
+}
+
+// mergeYAMLFields merges field updates into a YAML structure
+// Supports dot-notation paths like "nested.field" for deep updates
+func mergeYAMLFields(base map[string]interface{}, updates map[string]interface{}) (map[string]interface{}, error) {
+	result := make(map[string]interface{})
+
+	// Copy base values
+	for k, v := range base {
+		result[k] = v
+	}
+
+	// Apply updates
+	for key, value := range updates {
+		// Check if key contains dot notation (nested path)
+		if strings.Contains(key, ".") {
+			// Handle nested field updates
+			parts := strings.Split(key, ".")
+			if err := setNestedField(result, parts, value); err != nil {
+				return nil, fmt.Errorf("failed to set nested field %s: %w", key, err)
+			}
+		} else {
+			// Simple field update
+			result[key] = value
+		}
+	}
+
+	return result, nil
+}
+
+// setNestedField sets a nested field in a map using a path of keys
+func setNestedField(m map[string]interface{}, path []string, value interface{}) error {
+	if len(path) == 0 {
+		return fmt.Errorf("path cannot be empty")
+	}
+
+	if len(path) == 1 {
+		m[path[0]] = value
+		return nil
+	}
+
+	// Navigate/create nested structure
+	key := path[0]
+	remainingPath := path[1:]
+
+	// Get or create nested map
+	var nested map[string]interface{}
+	if existing, ok := m[key]; ok {
+		if existingMap, ok := existing.(map[string]interface{}); ok {
+			nested = existingMap
+		} else {
+			// Overwrite with new map
+			nested = make(map[string]interface{})
+			m[key] = nested
+		}
+	} else {
+		nested = make(map[string]interface{})
+		m[key] = nested
+	}
+
+	// Recursively set nested field
+	return setNestedField(nested, remainingPath, value)
+}
+
+// compareYAMLFields compares YAML structures to see if updates are needed
+func compareYAMLFields(current map[string]interface{}, updates map[string]interface{}) (bool, error) {
+	for key, updateValue := range updates {
+		// Check if key contains dot notation (nested path)
+		if strings.Contains(key, ".") {
+			parts := strings.Split(key, ".")
+			currentValue, exists := getNestedField(current, parts)
+			if !exists {
+				log.Printf("Field %s doesn't exist, update needed", key)
+				return true, nil
+			}
+			if !valuesEqual(currentValue, updateValue) {
+				log.Printf("Field %s differs: current=%v, update=%v", key, currentValue, updateValue)
+				return true, nil
+			}
+		} else {
+			// Simple field comparison
+			currentValue, exists := current[key]
+			if !exists {
+				log.Printf("Field %s doesn't exist, update needed", key)
+				return true, nil
+			}
+			if !valuesEqual(currentValue, updateValue) {
+				log.Printf("Field %s differs: current=%v, update=%v", key, currentValue, updateValue)
+				return true, nil
+			}
+		}
+	}
+	log.Printf("All YAML fields match, no update needed")
+	return false, nil
+}
+
+// valuesEqual compares two values with type conversion support
+// Handles cases like int(5432) == "5432" or float64(1.0) == int(1)
+func valuesEqual(a, b interface{}) bool {
+	// Direct equality check first
+	if a == b {
+		return true
+	}
+
+	// Convert both to strings and compare (handles type mismatches)
+	aStr := fmt.Sprintf("%v", a)
+	bStr := fmt.Sprintf("%v", b)
+
+	// Normalize whitespace for string comparison
+	aStr = strings.TrimSpace(aStr)
+	bStr = strings.TrimSpace(bStr)
+
+	return aStr == bStr
+}
+
+// getNestedField gets a nested field from a map using a path of keys
+func getNestedField(m map[string]interface{}, path []string) (interface{}, bool) {
+	if len(path) == 0 {
+		return nil, false
+	}
+
+	key := path[0]
+	value, exists := m[key]
+	if !exists {
+		return nil, false
+	}
+
+	if len(path) == 1 {
+		return value, true
+	}
+
+	// Navigate nested structure
+	if nestedMap, ok := value.(map[string]interface{}); ok {
+		return getNestedField(nestedMap, path[1:])
+	}
+
+	return nil, false
 }
 
 func getPatchType(patchType string) types.PatchType {

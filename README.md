@@ -57,6 +57,78 @@ Request Body:
 }
 ```
 
+#### Updating Specific Fields in YAML Files
+
+If a ConfigMap contains a YAML file as a string value, you can update specific fields within that YAML by providing a map object instead of a string. The service will parse the existing YAML, merge your updates, and serialize it back.
+
+**Example:** Updating fields in a YAML configuration file
+
+Assume your ConfigMap has:
+```yaml
+data:
+  config.yaml: |
+    app:
+      name: myapp
+      version: 1.0
+    database:
+      host: localhost
+      port: 5432
+```
+
+To update specific fields, send:
+```json
+{
+  "namespace": "default",
+  "name": "my-configmap",
+  "patch": {
+    "data": {
+      "config.yaml": {
+        "app.version": "2.0",
+        "database.host": "db.example.com"
+      }
+    }
+  },
+  "patchType": "merge"
+}
+```
+
+This will update only the specified fields, preserving the rest of the YAML structure:
+```yaml
+data:
+  config.yaml: |
+    app:
+      name: myapp
+      version: 2.0
+    database:
+      host: db.example.com
+      port: 5432
+```
+
+**Features:**
+- **Dot notation support**: Use `"nested.field"` to update deeply nested fields
+- **Preserves structure**: Only updates specified fields, keeps the rest intact
+- **Idempotent**: Checks if updates are needed before patching
+- **Automatic YAML formatting**: Reformats YAML with proper indentation
+
+#### Automatic Deployment Restart
+
+After successfully patching a ConfigMap, the service automatically restarts the `registration-agent` deployment in the same namespace. This ensures pods pick up the new ConfigMap values.
+
+**Configuration:**
+- Default deployment name: `registration-agent`
+- Override via environment variable: `RESTART_DEPLOYMENT=<deployment-name>`
+- The deployment must exist in the same namespace as the ConfigMap
+
+**Note:** If the deployment restart fails, the ConfigMap patch is still considered successful (the restart error is logged as a warning).
+
+**RBAC Requirements:**
+The service account needs permissions to patch deployments:
+```yaml
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "patch"]
+```
+
 Response (Success):
 ```json
 {
