@@ -1,0 +1,36 @@
+# Git files
+.git
+.gitignore
+
+# Documentation
+*.md
+README.md
+DESIGN.md
+
+# Kubernetes manifests (not needed in container)
+k8s/
+*.yaml
+*.yml
+
+# Docker files
+Dockerfile
+.dockerignore
+
+# Build/deployment scripts (not needed for building)
+deploy.sh
+Makefile
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Build artifacts (if any exist)
+*.test
+configmap-event-handler
+
